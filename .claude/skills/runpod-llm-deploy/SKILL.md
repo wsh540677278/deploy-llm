@@ -1,99 +1,95 @@
 ---
 name: runpod-llm-deploy
-description: Deploy a small open-source LLM (default Qwen2.5-3B-Instruct) on RunPod with an A100 GPU via vLLM, exposing an OpenAI-compatible chat API URL callable from the user's local machine, at minimal cost. Use when the user wants to deploy/serve an LLM on RunPod, get the inference API URL, test the chat endpoint, or stop/terminate the deployment to save money.
+description: Launch a vLLM OpenAI-compatible chat API for a small open-source LLM (default Qwen2.5-3B-Instruct) from INSIDE a RunPod GPU pod, and expose it via RunPod's HTTP proxy so the user can call it from their local machine. Use when running inside a RunPod pod to start/stop/health-check the model server, get the public API URL, or troubleshoot serving. Covers server launch + network access only — the user creates the pod and SSHes in themselves.
 ---
 
-# RunPod LLM Deployment Skill
+# RunPod In-Pod LLM Serving Skill
 
-Goal: stand up a **chat-style (OpenAI-compatible) API** on RunPod backed by an
-**A100 GPU**, return the **API URL + key** for local calls, and keep **cost as
-low as possible**.
+Division of labor:
+- **User (manual, RunPod console):** create the A100 pod from a vLLM image,
+  SSH in, clone this repo.
+- **This skill (inside the pod):** launch the vLLM server, verify health,
+  expose the OpenAI-compatible chat API through RunPod's proxy, hand back the
+  public URL + key so the user can call it from local.
 
-## Key decisions (defaults)
+## Pod-creation checklist (user does this once, in the console)
 
-| Decision | Default | Why |
+The skill can only expose what the pod allows — these settings matter:
+
+| Setting | Value | Why |
 |---|---|---|
-| Model | `Qwen/Qwen2.5-3B-Instruct` | small, strong, Apache-2.0, no HF gating |
-| Framework | **vLLM** (`vllm/vllm-openai:latest` image) | OpenAI-compatible `/v1/chat/completions` out of the box; RunPod also has a pre-built vLLM template. SGLang (`lmsysorg/sglang:latest`) is a fine alternative — same OpenAI-compatible API |
-| GPU | A100 80GB (user requirement) | note: a 3B model fits easily on a cheaper RTX 4090/A5000 — offer this to cut cost ~3-4x if user is flexible |
-| Cloud type | **COMMUNITY** cloud | cheaper than SECURE cloud |
-| API style | OpenAI-compatible chat completions | works with any OpenAI SDK/client from local |
+| GPU | A100 80GB, **Community Cloud** | requirement; community = cheaper |
+| Image | `vllm/vllm-openai:latest` (or RunPod's vLLM template / any CUDA+Python image) | vLLM preinstalled |
+| **Container Start Command** | `sleep infinity` | prevents the image entrypoint from auto-starting a server — the skill controls launch |
+| **Expose HTTP Ports** | **8000** | REQUIRED — this is what makes `https://<POD_ID>-8000.proxy.runpod.net` work |
+| Volume (`/workspace`) | 30 GB+ | persists model weights + API key across pod stop/start |
+| SSH | enabled (default) | user's access path |
 
-## Cost minimization rules (IMPORTANT — apply always)
+If port 8000 was not exposed at creation: edit the pod's config (or recreate).
+Without it there is no proxy URL — that's the #1 gotcha.
 
-1. **Prefer RunPod Serverless vLLM endpoint** for intermittent chat use:
-   flex workers **scale to zero** — you pay per request-second, $0 while idle.
-   A pod bills every minute it runs, even idle.
-2. If using a Pod: **COMMUNITY cloud**, and **stop the pod whenever idle**
-   (stopped pods only bill disk, ~cents/day). Terminate fully when done.
-3. Keep `--max-model-len` modest (e.g. 8192) — smaller KV cache, faster start.
-4. Don't over-provision disk: 20–30 GB container disk is plenty for a 3B model.
-5. Remind the user at the end of every deploy: "stop it when you're done."
+## In-pod workflow (what the skill does)
 
-## Prerequisites
+1. `scripts/serve.sh` — launches the server. It:
+   - defaults `MODEL=Qwen/Qwen2.5-3B-Instruct`, `PORT=8000`, `MAX_LEN=8192`
+   - sets `HF_HOME=/workspace/huggingface` so **weights persist across
+     pod stop/start** (restart = no re-download = faster + cheaper)
+   - generates a `VLLM_API_KEY` if absent and persists it to
+     `/workspace/.vllm_api_key` (reused on restarts)
+   - if something is already healthy on the port, just reports the URL
+   - otherwise starts vLLM with `nohup` (survives SSH disconnect), logs to
+     `/workspace/vllm.log`, waits for `/health` to go green
+   - prints the public URL: `https://$RUNPOD_POD_ID-8000.proxy.runpod.net/v1`
+2. `scripts/stop_serve.sh` — stops the server process (pod keeps running).
+3. Verify externally: the proxy URL's `/health` should return 200 from
+   anywhere; then run `scripts/test_chat.sh` from the user's local machine.
 
-- RunPod account with credits: https://runpod.io
-- `RUNPOD_API_KEY` env var (create at Settings → API Keys)
-- Choose a `VLLM_API_KEY` (any random string) to protect the endpoint.
-- Put both in `.env` (git-ignored). Never commit keys.
+## Calling from local (user's machine)
 
-## Path A — GPU Pod (always-on URL, simplest; use scripts/)
-
-1. Verify current GPU type IDs and pricing first (they drift):
-   query RunPod's API or check the console pricing page. If anything in the
-   scripts 404s or errors, check https://docs.runpod.io — the API surface has
-   both a GraphQL endpoint (`api.runpod.io/graphql`) and a newer REST API;
-   prefer whichever the current docs recommend.
-2. Run `scripts/create_pod.sh` — creates a COMMUNITY-cloud A100 pod running
-   `vllm/vllm-openai:latest` serving the model on port 8000 (exposed via
-   RunPod's HTTP proxy).
-3. Wait for the pod to pull the image + load weights (~2–5 min). The API URL is:
-
-   `https://<POD_ID>-8000.proxy.runpod.net/v1`
-
-4. Test with `scripts/test_chat.sh` (or `client/chat_client.py` locally).
-5. When the user is done: `scripts/stop_pod.sh <POD_ID>` (stop = keep disk,
-   minimal cost) or terminate from the console ($0).
-
-## Path B — Serverless vLLM endpoint (cheapest for intermittent use)
-
-RunPod has a **pre-built "Serverless vLLM" quick-deploy**: Console → Serverless
-→ Quick Deploy → vLLM. Configure:
-- Model: `Qwen/Qwen2.5-3B-Instruct`
-- GPU: A100 80GB; **Active workers: 0**, Max workers: 1 (scale-to-zero)
-- The endpoint URL is `https://api.runpod.ai/v2/<ENDPOINT_ID>/openai/v1`
-  and is OpenAI-compatible; auth uses the RunPod API key as Bearer token.
-
-Cold starts add ~30–60s on the first request after idle — the price of $0 idle
-cost. Recommend Path B when the user's usage is bursty/occasional (typical
-personal chatbot), Path A when they want a warm, always-on endpoint.
-
-## Calling from local (either path)
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="<API_URL>", api_key="<KEY>")
-r = client.chat.completions.create(
-    model="Qwen/Qwen2.5-3B-Instruct",
-    messages=[{"role": "user", "content": "hello"}],
-)
-print(r.choices[0].message.content)
+```bash
+export API_URL="https://<POD_ID>-8000.proxy.runpod.net/v1"
+export VLLM_API_KEY="<printed by serve.sh>"
+./scripts/test_chat.sh                 # curl smoke test
+python client/chat_client.py           # streaming chatbot REPL (pip install openai)
 ```
+
+Any OpenAI SDK works: `OpenAI(base_url=API_URL, api_key=VLLM_API_KEY)`.
+
+## Cost rules (apply always)
+
+1. **Stop the pod from the console whenever idle** — an A100 pod bills every
+   minute it runs. Stopped pods pay only pennies/day for the volume, and
+   because weights + key live in `/workspace`, restart is fast:
+   start pod → `serve.sh` → same key, cached weights, new POD_ID/URL.
+2. Note: **POD_ID changes on stop/start** → the URL changes; re-run
+   `serve.sh` to print the fresh URL and update local `API_URL`.
+3. Keep `--max-model-len` modest (8192) and don't over-provision disk.
+4. If usage becomes rare/bursty, suggest migrating to RunPod **Serverless
+   vLLM** (scale-to-zero, $0 idle) as the cheaper long-term shape.
+5. End every session by reminding the user to stop the pod.
 
 ## Troubleshooting
 
-- **502/503 from proxy URL**: pod still booting or vLLM still loading weights —
-  check pod logs in console; wait for "Uvicorn running on 0.0.0.0:8000".
-- **CUDA OOM**: lower `--max-model-len`, or `--gpu-memory-utilization 0.90`.
-- **Gated model (Llama)**: needs `HF_TOKEN` env var in the pod; Qwen doesn't.
-- **GPU unavailable on COMMUNITY**: retry, or fall back to SECURE cloud /
-  another A100 variant (`NVIDIA A100-SXM4-80GB` vs `NVIDIA A100 80GB PCIe`).
+- **Proxy URL 404/refused:** port 8000 not in "Expose HTTP Ports" → fix pod
+  config. `RUNPOD_POD_ID` env var missing → not inside a RunPod pod.
+- **Proxy URL 502/503:** server still loading weights — `tail -f /workspace/vllm.log`,
+  wait for "Uvicorn running on 0.0.0.0:8000".
+- **CUDA OOM:** lower `MAX_LEN`, or `GPU_UTIL=0.85 ./serve.sh`.
+- **`vllm: command not found`:** serve.sh falls back to
+  `python3 -m vllm.entrypoints.openai.api_server`; if neither exists,
+  `pip install vllm` (or use the vllm/vllm-openai image).
+- **Gated model (Llama etc.):** `export HF_TOKEN=...` before serve.sh;
+  default Qwen model needs none.
+- **SGLang instead:** same pattern — `python3 -m sglang.launch_server
+  --model-path $MODEL --host 0.0.0.0 --port 8000` — the proxy URL logic
+  is identical.
 
-## Checklist for Claude when executing this skill
+## Checklist for Claude when executing this skill (inside the pod)
 
-1. Confirm `RUNPOD_API_KEY` is set; generate a `VLLM_API_KEY` if absent.
-2. Ask (or infer) Path A vs B based on usage pattern; default to B for cost.
-3. Verify current GPU IDs/pricing before creating resources.
-4. After deploy, ALWAYS print: API URL, API key env var name, model name,
-   estimated $/hr, and the stop/terminate command.
-5. Never leave a pod running after the user says they're done.
+1. Confirm we're in a pod: `RUNPOD_POD_ID` is set; GPU visible via `nvidia-smi`.
+2. Run `serve.sh`; don't duplicate servers — health-check first.
+3. After launch, ALWAYS print: public API URL, where the key lives, model
+   name, and the local test command.
+4. Verify the **external** proxy URL responds (not just localhost) before
+   declaring success.
+5. Remind the user: stop the pod when done; URL changes on restart.
