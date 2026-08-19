@@ -4,9 +4,13 @@ Sends N concurrent long-context requests with UNIQUE prefixes (a UUID at
 token 0 defeats prefix caching, so every request occupies its own KV blocks),
 while polling the server's /metrics endpoint to display live KV usage.
 
-Usage (defaults sized to saturate an A100-80GB Qwen3-8B pool ≈ 390K tokens):
-    python pressure_test.py                          # 64 x (5000 prompt + 1500 gen)
-    python pressure_test.py --concurrency 16 --prompt-tokens 2000   # partial fill
+Self-calibrates prompt sizing against the server's tokenizer (one probe request
+reading usage.prompt_tokens), so --prompt-tokens means real tokens.
+
+Usage (defaults sized to saturate an A100-80GB Qwen3-8B pool = 433,520 tokens,
+max context 8128; 72 x (5800+1200) = 504K demand -> ~100% usage + queueing):
+    python pressure_test.py
+    python pressure_test.py --concurrency 16     # partial fill (~25%)
 Config from ../.env: API_URL, VLLM_API_KEY, MODEL.
 Ctrl-C aborts. Expect several minutes at full defaults; watch the pod's
 loggers.py lines too (Running/Waiting/KV usage should mirror this output).
@@ -37,17 +41,35 @@ def load_env():
                 os.environ.setdefault(k.strip(), v.split("#")[0].strip())
 
 
-def make_prompt(n_tokens: int) -> str:
-    # UUID FIRST -> unique token 0 -> zero prefix-cache sharing between requests
-    filler = " ".join(random.choice(WORDS) for _ in range(n_tokens))
+def make_prompt(n_words: int) -> str:
+    # UUID FIRST -> unique token 0 -> zero prefix-cache sharing between requests.
+    filler = " ".join(random.choice(WORDS) for _ in range(n_words))
     return (f"{uuid.uuid4()} You are a storyteller. Using the word list below, "
             f"write the longest story you can.\n{filler}")
+
+
+async def calibrate(client, url, key, model, target_tokens: int) -> int:
+    """Measure the server tokenizer's tokens/word on our filler and return the
+    word count that yields ~target_tokens prompt tokens (3% safety margin)."""
+    probe_words = 1000
+    r = await client.post(f"{url}/chat/completions",
+                          headers={"Authorization": f"Bearer {key}"},
+                          json={"model": model, "max_tokens": 1,
+                                "messages": [{"role": "user",
+                                              "content": make_prompt(probe_words)}]})
+    r.raise_for_status()
+    measured = r.json()["usage"]["prompt_tokens"]
+    ratio = measured / probe_words                    # includes template overhead -> conservative
+    n_words = int(target_tokens / ratio * 0.97)
+    print(f"calibration: {probe_words} words -> {measured} tokens "
+          f"(ratio {ratio:.2f}) -> using {n_words} words/request")
+    return n_words
 
 
 async def one_request(client, url, key, model, args, stats):
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": make_prompt(args.prompt_tokens)}],
+        "messages": [{"role": "user", "content": make_prompt(args.n_words)}],
         "max_tokens": args.max_tokens,
         "temperature": 1.0,
         "chat_template_kwargs": {"enable_thinking": True},   # thinking = extra KV growth
@@ -97,9 +119,11 @@ async def monitor(client, base, key, stop, stats):
 async def main():
     load_env()
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--concurrency", type=int, default=72)   # 72 x 6.5K ≈ 468K tok > 433K pool -> saturation + queueing
-    ap.add_argument("--prompt-tokens", type=int, default=5000)
-    ap.add_argument("--max-tokens", type=int, default=1500)
+    # Server max context is 8128; 5800 + 1200 = 7000/request stays safely under,
+    # and 72 x 7000 = 504K tokens > the 433K-token KV pool -> saturation + queueing.
+    ap.add_argument("--concurrency", type=int, default=72)
+    ap.add_argument("--prompt-tokens", type=int, default=5800)
+    ap.add_argument("--max-tokens", type=int, default=1200)
     args = ap.parse_args()
 
     url = os.environ["API_URL"].rstrip("/")
@@ -117,6 +141,7 @@ async def main():
     stop = asyncio.Event()
     t0 = time.time()
     async with httpx.AsyncClient(timeout=httpx.Timeout(900, connect=30)) as client:
+        args.n_words = await calibrate(client, url, key, model, args.prompt_tokens)
         mon = asyncio.create_task(monitor(client, base, key, stop, stats))
         try:
             await asyncio.gather(*(one_request(client, url, key, model, args, stats)
