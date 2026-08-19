@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>deploy-llm chat</title>
+<style>
+  :root { --bg:#0f1117; --panel:#1a1d27; --me:#2b5cff22; --bot:#ffffff0a;
+          --text:#e6e6e6; --muted:#8a8f9d; --accent:#4c7dff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:15px/1.55 -apple-system, "Segoe UI", Roboto, sans-serif;
+         display:flex; flex-direction:column; height:100vh; }
+  header { padding:12px 20px; background:var(--panel); display:flex;
+           align-items:center; gap:10px; border-bottom:1px solid #ffffff12; }
+  header .dot { width:9px; height:9px; border-radius:50%; background:#3ddc84; }
+  header .model { color:var(--muted); font-size:13px; }
+  #log { flex:1; overflow-y:auto; padding:20px; display:flex;
+         flex-direction:column; gap:12px; max-width:860px; width:100%; margin:0 auto; }
+  .msg { padding:10px 14px; border-radius:12px; white-space:pre-wrap;
+         word-break:break-word; max-width:85%; }
+  .me  { background:var(--me); align-self:flex-end; border:1px solid #2b5cff44; }
+  .bot { background:var(--bot); align-self:flex-start; border:1px solid #ffffff14; }
+  .err { color:#ff7b7b; font-size:13px; align-self:center; }
+  form { display:flex; gap:10px; padding:16px 20px 22px; max-width:860px;
+         width:100%; margin:0 auto; }
+  textarea { flex:1; resize:none; background:var(--panel); color:var(--text);
+             border:1px solid #ffffff1c; border-radius:12px; padding:11px 14px;
+             font:inherit; outline:none; }
+  textarea:focus { border-color: var(--accent); }
+  button { background:var(--accent); border:0; color:#fff; border-radius:12px;
+           padding:0 22px; font:inherit; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot"></span><strong>deploy-llm chat</strong>
+  <span class="model" id="model">connecting…</span>
+</header>
+<div id="log"></div>
+<form id="form">
+  <textarea id="input" rows="2" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="send" type="submit">Send</button>
+</form>
+<script>
+const log = document.getElementById('log');
+const form = document.getElementById('form');
+const input = document.getElementById('input');
+const send = document.getElementById('send');
+const history = [];
+
+fetch('/api/config').then(r => r.json())
+  .then(c => document.getElementById('model').textContent = c.model)
+  .catch(() => document.getElementById('model').textContent = 'backend unreachable');
+
+function bubble(cls, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  d.textContent = text;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+  return d;
+}
+
+async function chat(text) {
+  history.push({ role: 'user', content: text });
+  bubble('me', text);
+  const bot = bubble('bot', '');
+  send.disabled = true;
+  try {
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: history }),
+    });
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', reply = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const frames = buf.split('\n\n');
+      buf = frames.pop();
+      for (const f of frames) {
+        if (!f.startsWith('data:')) continue;
+        const data = f.slice(5).trim();
+        if (data === '[DONE]') continue;
+        const j = JSON.parse(data);
+        if (j.error) { bubble('err', j.error); continue; }
+        const delta = j.choices?.[0]?.delta?.content || '';
+        reply += delta;
+        bot.textContent = reply;
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+    history.push({ role: 'assistant', content: reply });
+  } catch (e) {
+    bubble('err', 'request failed: ' + e.message);
+  } finally {
+    send.disabled = false;
+    input.focus();
+  }
+}
+
+form.addEventListener('submit', e => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  chat(text);
+});
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+});
+input.focus();
+</script>
+</body>
+</html>

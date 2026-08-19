@@ -35,6 +35,19 @@ export VLLM_API_KEY="<key from serve.sh>"
 python .claude/skills/runpod-llm-deploy/client/chat_client.py  # chat REPL
 ```
 
+## 4. Chat webapp (local)
+
+```bash
+cd webapp
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python app.py        # → open http://localhost:7860
+```
+
+Reads `API_URL` / `VLLM_API_KEY` / `MODEL` from `../.env`. The FastAPI proxy
+keeps the key server-side and streams tokens (SSE) to a single-page UI.
+Qwen3's thinking mode is disabled for snappy replies — send `"thinking": true`
+in the request body (or edit `app.py`) to re-enable chain-of-thought.
+
 ## 💰 Cost
 
 - **Stop the pod in the console whenever idle** — that's the whole game.
